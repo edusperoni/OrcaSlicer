@@ -158,6 +158,7 @@ protected:
         float       nozzle_diameter = 0.0f;
         bool        use_ssl = false;
         std::string ca_file;
+        std::set<std::string> components; // Moonraker components loaded on the server, e.g. "timelapse"
     } device_info;
 
     // Copied when the stream starts, so changes apply to the next start_status_stream(). A connection's retries read
@@ -263,6 +264,19 @@ protected:
 
     virtual void on_status_loop_tick(const std::string& dev_id) {}
 
+    // Adds printer-specific fields to the "print" object of each synthesized push_status.
+    // Called with payload_mutex held, so overrides must read only cached or atomic state.
+    virtual void append_print_payload(nlohmann::json& /*print*/) const {}
+
+    bool fetch_object_list(const ConnectionSettings&    connection,
+                           std::set<std::string>&       objects,
+                           std::string&                 error,
+                           const std::function<bool()>& cancelled) const;
+    bool query_printer_status(const ConnectionSettings&    connection,
+                              nlohmann::json&              status,
+                              std::string&                 error,
+                              const std::function<bool()>& cancelled) const;
+
     // Queue work that may use agent state. The command worker is joined during
     // destruction, so queued commands cannot outlive the agent.
     void enqueue_command(std::function<void()> fn);
@@ -279,12 +293,7 @@ private:
                   const std::function<bool()>& cancelled,
                   nlohmann::json&              json,
                   std::string&                 error) const;
-    bool fetch_object_list(const ConnectionSettings& connection, std::set<std::string>& objects, std::string& error) const;
     bool fetch_has_free_storage(const ConnectionSettings& connection, bool& has_free, std::string& error) const;
-    bool query_printer_status(const ConnectionSettings&    connection,
-                              nlohmann::json&              status,
-                              std::string&                 error,
-                              const std::function<bool()>& cancelled) const;
     bool send_gcode_sync(const std::string& dev_id, const std::string& gcode) const;
     void send_gcode_async(const std::string& dev_id, const std::string& gcode,
                           std::function<void(bool)> on_result = {}) const;

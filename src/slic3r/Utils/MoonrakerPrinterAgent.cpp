@@ -2159,6 +2159,12 @@ bool MoonrakerPrinterAgent::fetch_device_info(const ConnectionSettings&    conne
     info.dev_name         = result.value("machine_name", result.value("hostname", ""));
     info.version          = result.value("moonraker_version", "");
     info.klippy_state     = result.value("klippy_state", "");
+    if (result.contains("components") && result["components"].is_array()) {
+        for (const auto& component : result["components"]) {
+            if (component.is_string())
+                info.components.insert(component.get<std::string>());
+        }
+    }
 
     // nozzle_diameter is part of Klipper's configfile object rather than the live
     // extruder status object. Keep this optional so older/custom Moonraker builds
@@ -2574,12 +2580,12 @@ bool MoonrakerPrinterAgent::send_gcode(const std::string& dev_id, const std::str
 }
 
 bool MoonrakerPrinterAgent::fetch_object_list(const ConnectionSettings& connection,
-                                              std::set<std::string>& objects,
-                                              std::string&           error) const
+                                              std::set<std::string>&       objects,
+                                              std::string&                 error,
+                                              const std::function<bool()>& cancelled) const
 {
     nlohmann::json json;
-    // Gives up once the status stream, the only caller, stops
-    if (!get_json(join_url(connection.base_url, "/printer/objects/list"), connection, [this] { return ws_stop.load(); }, json, error)) {
+    if (!get_json(join_url(connection.base_url, "/printer/objects/list"), connection, cancelled, json, error)) {
         return false;
     }
 
@@ -2916,7 +2922,7 @@ void MoonrakerPrinterAgent::run_status_stream(std::string dev_id, ConnectionSett
             std::set<std::string> subscribe_objects = {"print_stats", "virtual_sdcard"};
             std::set<std::string> available_objects;
             std::string           list_error;
-            if (fetch_object_list(connection, available_objects, list_error)) {
+            if (fetch_object_list(connection, available_objects, list_error, [this] { return ws_stop.load(); })) {
                 {
                     std::lock_guard<std::recursive_mutex> lock(payload_mutex);
                     this->available_objects = std::move(available_objects);
@@ -3502,6 +3508,8 @@ nlohmann::json MoonrakerPrinterAgent::build_print_payload_locked() const
     const auto now_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
     payload["t_utc"] = now_ms;
+
+    append_print_payload(payload["print"]);
 
     return payload;
 }
