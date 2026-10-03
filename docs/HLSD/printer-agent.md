@@ -73,7 +73,7 @@ printer communication to obtain cloud tokens without depending on a concrete clo
 - cloud-relay and direct-LAN message delivery;
 - LAN connection, discovery, binding, and certificates;
 - printer subscriptions and callbacks;
-- print operations;
+- print operations, and the extra print options the send dialog offers for them;
 - filament synchronization;
 - camera capability and local camera URL reporting;
 - printer command methods.
@@ -158,6 +158,31 @@ The methods remain on the common interface so an agent that supports them can ov
 `sequence_id` remains part of the command contract because `DeviceManager` creates and tracks it as
 the command ID.
 
+## Send-time print options
+
+The send dialog (`SelectMachineDialog`) has built-in option rows such as Timelapse and Auto Bed
+Leveling, each gated by a `MachineObject` capability. A printer can also have options that no other
+printer shares, such as QIDI's Enable Box and Enable Polar Cooler. An agent declares these through
+`get_send_options(dev_id)`, which returns a `PrinterSendOption` (key, label, tooltip, default) for each
+option that applies to the device at that moment. Leaving an option out hides it.
+
+The dialog shows each declared option as an On/Off row after the built-in ones. It polls the agent on
+its status timer, so an option appears once the agent has learned the capability from the printer.
+Because of that polling on the UI thread, `get_send_options()` answers from cached state. A row's
+value is stored per printer type under the option key, like the built-in rows, so the key must not
+reuse a built-in option key; the dialog ignores one that does.
+
+On send, the values of the rows that are shown travel to the agent's `start_*` print call as a JSON
+object of booleans in `PrintParams::extra_options`, for example `{"enable_box":true}`. A dedicated
+`PrintParams` field is not an option: the struct is copied field by field into the versioned layouts
+of the Bambu network plug-in, so adding a field would break that binary interface. Agents that
+declare no options receive an empty `extra_options`.
+
+A built-in row is turned on through the capability it is gated by instead. Moonraker-based agents
+report capabilities in the `push_status` payload they synthesize, and a subclass adds its own fields
+through `MoonrakerPrinterAgent::append_print_payload()`; the Qidi agent sets `support_timelapse` there
+when Moonraker loads its timelapse component.
+
 ## Device ownership and stale responses
 
 Printer-agent ownership is represented by `printer_agent_id` on device records and `MachineObject`
@@ -200,6 +225,9 @@ status is intentionally optional:
 - the five generic commands use the C++ default when Python does not override them;
 - the five vendor-specific commands return `NOT_SUPPORTED` unless Python supplies an implementation;
 - a Python implementation can replace either behavior for its own protocol.
+
+`get_send_options()` and the `PrinterSendOption` value type are bound as well, so a Python agent can
+declare send-time print options the same way.
 
 The Python camera binding exposes HTTP, HTTPS, RTSP, and HTTP-snapshot modes. WebRTC remains a
 built-in C++ camera mode, but is not exposed as a Python mode because the current Python capability
