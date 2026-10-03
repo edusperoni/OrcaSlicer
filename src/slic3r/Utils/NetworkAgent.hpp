@@ -188,6 +188,7 @@ public:
     int start_local_print(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn);
     int start_sdcard_print(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn);
     FilamentSyncMode get_filament_sync_mode() const;
+    std::vector<PrinterSendOption> get_send_options(const std::string& dev_id) const;
     bool fetch_filament_info(std::string dev_id, FilamentSyncMode sync_mode = FilamentSyncMode::pull);
     CameraStreamMode get_camera_stream_mode() const;
     std::string get_local_camera_stream_url() const;

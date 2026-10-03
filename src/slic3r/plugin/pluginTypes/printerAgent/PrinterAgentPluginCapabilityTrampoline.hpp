@@ -7,6 +7,7 @@
 #include "IPrinterAgent.hpp"
 #include "slic3r/Utils/bambu_networking.hpp"
 #include "pybind11/pybind11.h"
+#include <pybind11/stl.h>
 #include <exception>
 #include <functional>
 #include <pybind11/cast.h>
@@ -190,6 +191,11 @@ public:
     std::string get_camera_url() const override
     {
         ORCA_PY_AGENT_OVERRIDE_DEFAULT(std::string, get_camera_url);
+    }
+
+    std::vector<PrinterSendOption> get_send_options(const std::string& dev_id) const override
+    {
+        ORCA_PY_AGENT_OVERRIDE_DEFAULT(std::vector<PrinterSendOption>, get_send_options, dev_id);
     }
 
     bool fetch_filament_info(std::string dev_id, FilamentSyncMode sync_mode) override

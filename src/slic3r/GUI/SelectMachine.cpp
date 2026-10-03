@@ -3166,7 +3166,49 @@ void SelectMachineDialog::update_option_opts(MachineObject *obj)
     }
     m_checkbox_list["flow_cali"]->Show(obj->is_support_pa_calibration);
 
+    update_agent_send_options(obj);
     update_options_layout();
+}
+
+bool SelectMachineDialog::update_agent_send_options(MachineObject *obj)
+{
+    std::vector<PrinterSendOption> declared;
+    if (NetworkAgent *agent = wxGetApp().getAgent(); agent && obj)
+        declared = agent->get_send_options(obj->get_dev_id());
+
+    bool                  changed = false;
+    std::set<std::string> declared_keys;
+    for (const PrinterSendOption &def : declared) {
+        auto it = m_checkbox_list.find(def.key);
+        if (it == m_checkbox_list.end()) {
+            auto option = new PrintOption(m_options_other, from_u8(def.label), from_u8(def.tooltip), ops_no_auto, def.key);
+            option->Bind(EVT_SWITCH_PRINT_OPTION, [this](auto &) { save_option_vals(); });
+            // Created after Show() applied the dark theme to the dialog.
+            wxGetApp().UpdateDarkUIWin(option);
+            m_checkbox_list_order.push_back(option);
+            m_agent_option_defaults[def.key] = def.default_on;
+            it      = m_checkbox_list.emplace(def.key, option).first;
+            changed = true;
+        } else if (m_agent_option_defaults.count(def.key) == 0) {
+            if (m_agent_option_conflicts.insert(def.key).second)
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": agent option key '" << def.key << "' is taken by a built-in option, ignored";
+            continue;
+        }
+        declared_keys.insert(def.key);
+        if (!it->second->IsShown()) {
+            it->second->Show();
+            changed = true;
+        }
+    }
+
+    for (const auto &[key, default_on] : m_agent_option_defaults) {
+        PrintOption *option = m_checkbox_list[key];
+        if (declared_keys.count(key) == 0 && option->IsShown()) {
+            option->Hide();
+            changed = true;
+        }
+    }
+    return changed;
 }
 
 static bool _HasExt(const std::vector<FilamentInfo> &ams_mapping_result) {
@@ -3222,6 +3264,8 @@ void SelectMachineDialog::load_option_vals(MachineObject *obj)
         const std::string &val = config->get(obj->printer_type, item.first);
         if (opt->contain_opt(val)) {
             opt->setValue(val);
+        } else if (auto agent_option = m_agent_option_defaults.find(item.first); agent_option != m_agent_option_defaults.end()) {
+            opt->setValue(agent_option->second ? "on" : "off");
         } else if (opt->contain_opt("auto")) {
             opt->setValue("auto");
         } else if (opt->contain_opt("on")) {
@@ -3775,6 +3819,14 @@ void SelectMachineDialog::on_send_print()
         pa_manual_mode
     );
 
+    json agent_options = json::object();
+    for (const auto &[key, default_on] : m_agent_option_defaults) {
+        if (PrintOption *option = m_checkbox_list[key]; option->IsShown())
+            agent_options[key] = option->getValue() == "on";
+    }
+    if (!agent_options.empty())
+        m_print_job->task_extra_options = agent_options.dump();
+
     if (obj_->HasAms()) {
         bool has_ext = _HasExt(m_ams_mapping_result);
         bool has_ams = _HasAms(m_ams_mapping_result);
@@ -4237,7 +4289,16 @@ void SelectMachineDialog::on_timer(wxTimerEvent &event)
         }
     }
 
+    // An agent learns some capabilities only after connecting, past the one-time
+    // update_select_layout(), so its option rows are re-checked on every tick.
+    const bool agent_options_changed = !m_is_in_sending_mode && update_agent_send_options(obj_);
     load_option_vals(obj_);
+    if (agent_options_changed) {
+        update_options_layout();
+        m_options_other->Layout();
+        Layout();
+        Fit();
+    }
     update_show_status(obj_);
     update_print_status_msg();
     //update_scroll_area_size();/*STUDIO-12867 the page maybe blank in some platform. FIXME*/
