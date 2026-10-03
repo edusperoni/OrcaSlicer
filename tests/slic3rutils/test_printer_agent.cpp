@@ -493,7 +493,7 @@ TEST_CASE("orca.printer_agent binding surface", "[integration][Python]")
                                 "command_xyz_abs", "command_auto_leveling", "command_go_home",
                                 "command_set_bed", "command_set_nozzle", "command_axis_control",
                                 "start_discovery", "bind_detect",
-                                "start_print", "get_filament_sync_mode" }) {
+                                "start_print", "get_filament_sync_mode", "get_send_options" }) {
         CAPTURE(method);
         CHECK(py::hasattr(base, method));
     }
@@ -503,6 +503,12 @@ TEST_CASE("orca.printer_agent binding surface", "[integration][Python]")
     py::object info = pa.attr("AgentInfo")("moonraker", "Moonraker", "1.0", "test agent");
     CHECK(info.attr("id").cast<std::string>() == "moonraker");
     CHECK(info.attr("name").cast<std::string>() == "Moonraker");
+
+    // PrinterSendOption value type - an extra On/Off row an agent adds to the send dialog.
+    REQUIRE(py::hasattr(pa, "PrinterSendOption"));
+    py::object send_option = pa.attr("PrinterSendOption")("enable_box", "Enable Box");
+    CHECK(send_option.attr("key").cast<std::string>() == "enable_box");
+    CHECK_FALSE(send_option.attr("default_on").cast<bool>());
 
     // FilamentSyncMode enum the host queries to pick pull vs subscription.
     REQUIRE(py::hasattr(pa, "FilamentSyncMode"));

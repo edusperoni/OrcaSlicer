@@ -102,6 +102,17 @@ void PrinterAgentPluginCapability::RegisterBindings(pybind11::module_& module)
         .def_readwrite("task_ext_change_assist", &PrintParams::task_ext_change_assist)
         .def_readwrite("try_emmc_print", &PrintParams::try_emmc_print);
 
+    py::class_<PrinterSendOption>(printer_agent_module, "PrinterSendOption")
+        .def(py::init<>())
+        .def(py::init([](std::string key, std::string label, std::string tooltip, bool default_on) {
+                 return PrinterSendOption{std::move(key), std::move(label), std::move(tooltip), default_on};
+             }),
+             py::arg("key"), py::arg("label"), py::arg("tooltip") = "", py::arg("default_on") = false)
+        .def_readwrite("key", &PrinterSendOption::key)
+        .def_readwrite("label", &PrinterSendOption::label)
+        .def_readwrite("tooltip", &PrinterSendOption::tooltip)
+        .def_readwrite("default_on", &PrinterSendOption::default_on);
+
     py::class_<PrinterConnectionParams>(printer_agent_module, "PrinterConnectionParams")
         .def(py::init<>())
         .def_readwrite("dev_id", &PrinterConnectionParams::dev_id)
@@ -141,6 +152,7 @@ void PrinterAgentPluginCapability::RegisterBindings(pybind11::module_& module)
         .def("get_camera_stream_mode", &PrinterAgentPluginCapability::get_camera_stream_mode)
         .def("fetch_filament_info", &PrinterAgentPluginCapability::fetch_filament_info)
         .def("get_camera_url", &PrinterAgentPluginCapability::get_camera_url)
+        .def("get_send_options", &PrinterAgentPluginCapability::get_send_options)
         .def("check_cert", &PrinterAgentPluginCapability::check_cert)
         .def("install_device_cert", &PrinterAgentPluginCapability::install_device_cert)
         .def("ping_bind", &PrinterAgentPluginCapability::ping_bind)

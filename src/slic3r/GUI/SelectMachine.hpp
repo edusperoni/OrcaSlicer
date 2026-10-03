@@ -6,6 +6,7 @@
 #include <vector>
 #include "libslic3r/ProjectTask.hpp"
 #include <map>
+#include <set>
 #include <wx/image.h>
 #include <wx/event.h>
 #include <wx/dc.h>
@@ -337,6 +338,9 @@ private:
 
     std::unordered_map<std::string, PrintOption*> m_checkbox_list;
     std::list<PrintOption*>                  m_checkbox_list_order;
+    // Rows created for IPrinterAgent::get_send_options(), by key, with each one's default value.
+    std::map<std::string, bool>              m_agent_option_defaults;
+    std::set<std::string>                    m_agent_option_conflicts;
 
     std::shared_ptr<int>                m_token = std::make_shared<int>(0);
     wxString                             m_ams_tooltip;
@@ -626,6 +630,8 @@ private:
     /* update option area*/
     void update_option_opts(MachineObject *obj);
     void update_options_layout();
+    // Shows the rows the printer agent declares for obj and hides the rest; true if any changed.
+    bool update_agent_send_options(MachineObject *obj);
 
     /* timelapse storage-location selector */
     void update_timelapse_folder_btn_icon();

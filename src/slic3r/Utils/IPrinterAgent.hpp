@@ -81,6 +81,20 @@ enum class CameraStreamMode {
 };
 
 /**
+ * PrinterSendOption - An On/Off print option an agent adds to the send dialog.
+ *
+ * The key names the option's value in PrintParams::extra_options and its persisted value in
+ * AppConfig, so it must stay stable and must not reuse a built-in dialog option key.
+ */
+struct PrinterSendOption
+{
+    std::string key;
+    std::string label;   ///< localized, UTF-8
+    std::string tooltip; ///< localized, UTF-8
+    bool        default_on = false;
+};
+
+/**
  * IPrinterAgent - Interface for printer operations.
  *
  * This interface encapsulates all printer-related functionality:
@@ -495,6 +509,16 @@ public:
      * Only meaningful when get_camera_stream_mode() returns an HTTP, HTTPS, or RTSP mode.
      */
     virtual std::string get_camera_url() const { return {}; }
+
+    /**
+     * Get the extra print options the send dialog shows for this device. Return only the options
+     * that apply to the device right now; an option left out is hidden. The chosen values reach
+     * the start_* print calls as a JSON object of booleans in PrintParams::extra_options, keyed
+     * by option key, holding only the options that were shown.
+     *
+     * The dialog polls this on the UI thread, so it must answer from cached state.
+     */
+    virtual std::vector<PrinterSendOption> get_send_options(const std::string& /*dev_id*/) const { return {}; }
 };
 
 } // namespace Slic3r

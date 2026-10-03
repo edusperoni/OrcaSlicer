@@ -1079,6 +1079,13 @@ FilamentSyncMode NetworkAgent::get_filament_sync_mode() const
     return FilamentSyncMode::none;
 }
 
+std::vector<PrinterSendOption> NetworkAgent::get_send_options(const std::string& dev_id) const
+{
+    if (m_printer_agent)
+        return m_printer_agent->get_send_options(dev_id);
+    return {};
+}
+
 bool NetworkAgent::fetch_filament_info(std::string dev_id, FilamentSyncMode sync_mode)
 {
     if (m_printer_agent) {
