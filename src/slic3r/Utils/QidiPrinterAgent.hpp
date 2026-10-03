@@ -6,6 +6,7 @@
 #include "bambu_networking.hpp"
 #include "nlohmann/json_fwd.hpp"
 
+#include <atomic>
 #include <map>
 #include <string>
 #include <vector>
@@ -29,22 +30,45 @@ public:
                                     nlohmann::json&    variables,
                                     std::string&       error);
 
-    // Print operations — emit QiDi multi-color box config, then delegate to base.
+    // Print operations — apply the job's QIDI print options, then delegate to base.
     // Only the LAN print path is supported by the base; the cloud/record/sdcard variants
     // are inherited and return ORCA_NETWORK_ERR_CMD_NOT_SUPPORTED.
     int start_local_print(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn) override;
 
     FilamentSyncMode get_filament_sync_mode() const override;
 
+    int connect_printer(const PrinterConnectionParams& params) override;
+
+    std::vector<PrinterSendOption> get_send_options(const std::string& dev_id) const override;
+
+    // Whether a print may be started while Klipper's print_stats is in this state.
+    static bool is_ready_to_print(const std::string& print_state);
+
+    // G-code scripts that apply the job's box, slot mapping, bed leveling and polar cooler
+    // options, in the order they must run. Returns false when the filament mapping is malformed.
+    static bool build_print_commands(const PrintParams&        params,
+                                     bool                      has_leveling_macros,
+                                     std::vector<std::string>& gcode,
+                                     std::string&              error);
+
 protected:
+    void append_print_payload(nlohmann::json& print) const override;
     // Starts the print through Moonraker, whose print start copies the upload to where Qidi's Klipper reads it
     bool print_uploaded_file(const PrintParams& params, const ConnectionSettings& connection, const std::string& filename) override;
     std::string ams_unit_name(int ams_id) const override { return "Qidi Box " + std::to_string(ams_id + 1); }
 
 private:
-    // Push enable_box + value_t<tool> SAVE_VARIABLEs before a print starts.
-    // Returns false if any command fails (caller should abort the print).
-    bool apply_box_mapping(const PrintParams& params) const;
+    // Checks the printer is idle, then sends the job's print options before a print starts.
+    // Returns false, after reporting the reason through update_fn, if the print must not start.
+    bool apply_print_options(const PrintParams& params, const OnUpdateStatusFn& update_fn) const;
+    bool set_timelapse_enabled(const ConnectionSettings& connection, bool enabled, std::string& error) const;
+
+    // Printer capabilities, refreshed by the filament fetch thread and read from the UI thread.
+    std::atomic<bool> m_box_present{false};
+    std::atomic<bool> m_polar_cooler{false};
+    std::atomic<bool> m_leveling_macros{false};
+    std::atomic<bool> m_timelapse{false};
+
     struct QidiFilamentDict
     {
         std::map<int, std::string> colors;

@@ -5,13 +5,16 @@
 #include "bambu_networking.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
+#include "slic3r/GUI/I18N.hpp"
 
 #include "nlohmann/json.hpp"
 #include <atomic>
 #include <boost/algorithm/string.hpp>
+#include <boost/format.hpp>
 #include <boost/algorithm/string/trim.hpp>
 #include <boost/algorithm/string/case_conv.hpp>
 #include <boost/log/trivial.hpp>
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include "libslic3r/Preset.hpp"
@@ -19,6 +22,8 @@
 #include <exception>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <string>
@@ -124,7 +129,22 @@ bool QidiPrinterAgent::fetch_filament_info(std::string dev_id, FilamentSyncMode 
             {
                 MoonrakerDeviceInfo info;
                 if (fetch_device_info(connection, info, error, {})) {
-                    series_id = infer_series_id(info.model_id, info.dev_name);
+                    series_id   = infer_series_id(info.model_id, info.dev_name);
+                    m_timelapse = info.components.count("timelapse") != 0;
+                }
+            }
+            {
+                std::set<std::string> objects;
+                if (fetch_object_list(connection, objects, error, {})) {
+                    // Klipper keeps config section names as written, so match them case-insensitively.
+                    const auto has_object = [&objects](const std::string& name) {
+                        return std::any_of(objects.begin(), objects.end(),
+                                           [&name](const std::string& object) { return boost::iequals(object, name); });
+                    };
+                    m_polar_cooler    = has_object("output_pin polar_cooler");
+                    m_leveling_macros = has_object("gcode_macro G31") && has_object("gcode_macro G32");
+                } else {
+                    BOOST_LOG_TRIVIAL(warning) << "QidiPrinterAgent::fetch_filament_info: Failed to fetch object list: " << error;
                 }
             }
             if (series_id.empty()) {
@@ -198,58 +218,153 @@ bool QidiPrinterAgent::fetch_filament_info(std::string dev_id, FilamentSyncMode 
     return true;
 }
 
-bool QidiPrinterAgent::apply_box_mapping(const PrintParams& params) const
+int QidiPrinterAgent::connect_printer(const PrinterConnectionParams& params)
 {
-    // enable_box mirrors task_use_ams: engage the multi-color box only when this
-    // job actually routes filament through it. (See qidi-ams-findings.md §2/§8.3 —
-    // if firmware treats enable_box as "a box exists" rather than "use it this job",
-    // switch this gate to HasAms()/box_count instead.)
-    const int         enable = params.task_use_ams ? 1 : 0;
-    const std::string dev_id = get_connection_settings().dev_id;
+    // The agent instance is shared by every Qidi preset; forget the previous printer's capabilities.
+    m_box_present     = false;
+    m_polar_cooler    = false;
+    m_leveling_macros = false;
+    m_timelapse       = false;
+    return MoonrakerPrinterAgent::connect_printer(params);
+}
 
-    // Build one gcode/script request instead of N blocking HTTP calls: apply_box_mapping
-    // runs on the caller's (GUI) thread before the print starts, so per-tool round trips
-    // would freeze the UI.
-    std::string script = "SAVE_VARIABLE VARIABLE=enable_box VALUE=" + std::to_string(enable);
+std::vector<PrinterSendOption> QidiPrinterAgent::get_send_options(const std::string& /*dev_id*/) const
+{
+    std::vector<PrinterSendOption> options;
+    if (m_box_present)
+        options.push_back({"enable_box", _u8L("Enable Box"),
+                           _u8L("Feed filament from the QIDI Box. When off, the printer prints from the external spool."), true});
+    if (m_polar_cooler)
+        options.push_back({"polar_cooler", _u8L("Enable Polar Cooler"), _u8L("Run the polar cooler fan during the print."), false});
+    return options;
+}
 
-    // When the box isn't used this job, leave the existing value_t<tool> slot
-    // assignments untouched (enable_box=0 is enough to disengage it).
-    if (enable) {
-        if (params.ams_mapping.empty()) {
-            BOOST_LOG_TRIVIAL(warning) << "QidiPrinterAgent::apply_box_mapping: enable_box set but ams_mapping is empty";
-        } else {
-            // ams_mapping (v0) is a JSON array indexed by filament/tool; each value is the
-            // physical box slot (-1 = unmapped). Mirror it onto value_t<tool>.
-            auto mapping = nlohmann::json::parse(params.ams_mapping, nullptr, /*allow_exceptions*/ false);
-            if (mapping.is_discarded() || !mapping.is_array()) {
-                BOOST_LOG_TRIVIAL(error) << "QidiPrinterAgent::apply_box_mapping: invalid ams_mapping: " << params.ams_mapping;
-                return false;
-            }
-            for (size_t tool = 0; tool < mapping.size(); ++tool) {
-                if (!mapping[tool].is_number_integer())
-                    continue;
-                const int slot = mapping[tool].get<int>();
-                if (slot < 0)
-                    continue; // unmapped filament — skip
-                script += "\nSAVE_VARIABLE VARIABLE=value_t" + std::to_string(tool) +
-                          " VALUE=\"'slot" + std::to_string(slot) + "'\"";
-            }
+void QidiPrinterAgent::append_print_payload(nlohmann::json& print) const
+{
+    print["support_timelapse"] = m_timelapse.load();
+}
+
+bool QidiPrinterAgent::is_ready_to_print(const std::string& print_state)
+{
+    // Klipper keeps the last job's end state until the next print starts.
+    return print_state == "standby" || print_state == "complete" || print_state == "cancelled" || print_state == "error";
+}
+
+bool QidiPrinterAgent::build_print_commands(const PrintParams&        params,
+                                            bool                      has_leveling_macros,
+                                            std::vector<std::string>& gcode,
+                                            std::string&              error)
+{
+    gcode.clear();
+
+    nlohmann::json extra = nlohmann::json::parse(params.extra_options, nullptr, false);
+    if (!extra.is_object())
+        extra = nlohmann::json::object();
+    const auto option = [&extra](const char* key) -> std::optional<bool> {
+        const auto it = extra.find(key);
+        if (it == extra.end() || !it->is_boolean())
+            return std::nullopt;
+        return it->get<bool>();
+    };
+
+    // Enable Box can only turn the box off: a job that maps no filament to the box writes no
+    // value_t<n>, so an enabled box would load the slots a previous job saved.
+    const bool use_box = params.task_use_ams && option("enable_box").value_or(true);
+    gcode.push_back(std::string("SAVE_VARIABLE VARIABLE=enable_box VALUE=") + (use_box ? "1" : "0"));
+
+    // The firmware's T<n> macro loads from the slot saved in value_t<n>, so each project
+    // filament index maps to its box slot. A box that is off ignores them.
+    if (use_box && !params.ams_mapping.empty()) {
+        const nlohmann::json mapping = nlohmann::json::parse(params.ams_mapping, nullptr, false);
+        if (!mapping.is_array()) {
+            error = "invalid filament mapping: " + params.ams_mapping;
+            return false;
+        }
+        for (size_t tool = 0; tool < mapping.size(); ++tool) {
+            if (!mapping[tool].is_number_integer())
+                continue;
+            const int slot = mapping[tool].get<int>();
+            if (slot < 0)
+                continue;
+            gcode.push_back("SAVE_VARIABLE VARIABLE=value_t" + std::to_string(tool) + " VALUE=\"'slot" + std::to_string(slot) + "'\"");
         }
     }
 
-    if (!send_gcode(dev_id, script)) {
-        BOOST_LOG_TRIVIAL(error) << "QidiPrinterAgent::apply_box_mapping: failed to send box mapping";
+    // G31/G32 switch the mesh the firmware's G29 builds; PRINT_END resets it, so it is sent every job.
+    if (has_leveling_macros)
+        gcode.push_back(params.task_bed_leveling ? "G31" : "G32");
+
+    if (const auto polar_cooler = option("polar_cooler"))
+        gcode.push_back(std::string("SAVE_VARIABLE VARIABLE=enable_polar_cooler VALUE=") + (*polar_cooler ? "1" : "0"));
+
+    return true;
+}
+
+bool QidiPrinterAgent::set_timelapse_enabled(const ConnectionSettings& connection, bool enabled, std::string& error) const
+{
+    bool success = false;
+    auto http    = Http::post(join_url(connection.base_url, std::string("/machine/timelapse/settings?enabled=") + (enabled ? "true" : "false")));
+    configure_http(http, connection);
+    if (!connection.api_key.empty())
+        http.header("X-Api-Key", connection.api_key);
+    http.header("Content-Type", "application/json")
+        .set_post_body(std::string("{}"))
+        .timeout_connect(5)
+        .timeout_max(10)
+        .on_complete([&](std::string, unsigned status) {
+            success = status == 200;
+            if (!success)
+                error = "HTTP error: " + std::to_string(status);
+        })
+        .on_error([&](std::string, std::string err, unsigned status) {
+            error = status > 0 ? err + " (HTTP " + std::to_string(status) + ")" : err;
+        })
+        .perform_sync();
+    return success;
+}
+
+bool QidiPrinterAgent::apply_print_options(const PrintParams& params, const OnUpdateStatusFn& update_fn) const
+{
+    const auto fail = [&update_fn](const std::string& detail) {
+        BOOST_LOG_TRIVIAL(error) << "QidiPrinterAgent::apply_print_options: " << detail;
+        if (update_fn)
+            update_fn(PrintingStageERROR, BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED, detail);
         return false;
-    }
+    };
+
+    const ConnectionSettings connection = get_connection_settings();
+
+    nlohmann::json status;
+    std::string    error;
+    if (!query_printer_status(connection, status, error, {}))
+        return fail((boost::format(_u8L("Failed to read the printer state: %1%")) % error).str());
+    const std::string state = status.contains("print_stats") && status["print_stats"].is_object()
+                                  ? status["print_stats"].value("state", "")
+                                  : "";
+    if (state.empty())
+        return fail(_u8L("The printer is not ready. Check that Klipper is running."));
+    if (!is_ready_to_print(state))
+        return fail((boost::format(_u8L("The printer is busy (%1%).")) % state).str());
+
+    std::vector<std::string> gcode;
+    if (!build_print_commands(params, m_leveling_macros, gcode, error))
+        return fail(error);
+    // One script request, as each gcode/script call blocks until Klipper has run it.
+    if (!send_gcode(connection.dev_id, boost::algorithm::join(gcode, "\n"), connection))
+        return fail(_u8L("Failed to apply the print options."));
+
+    if (m_timelapse && !set_timelapse_enabled(connection, params.task_record_timelapse, error))
+        return fail((boost::format(_u8L("Failed to set timelapse: %1%")) % error).str());
+
     return true;
 }
 
 int QidiPrinterAgent::start_local_print(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn)
 {
-    // Only the LAN print path is implemented by the Moonraker base; the box config is emitted
+    // Only the LAN print path is implemented by the Moonraker base; the print options are applied
     // here, before the print starts. The cloud/record/sdcard variants inherited from the base
     // deliberately return ORCA_NETWORK_ERR_CMD_NOT_SUPPORTED without side effects.
-    if (!apply_box_mapping(params))
+    if (!apply_print_options(params, update_fn))
         return BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED;
     return MoonrakerPrinterAgent::start_local_print(std::move(params), update_fn, cancel_fn);
 }
@@ -314,6 +429,7 @@ bool QidiPrinterAgent::fetch_slot_info(const ConnectionSettings& connection,
     if (box_count < 0) {
         box_count = 0;
     }
+    m_box_present = box_count > 0;
 
     const int max_slots = box_count * 4;
     trays.clear();
