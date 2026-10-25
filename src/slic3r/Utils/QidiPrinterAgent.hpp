@@ -51,10 +51,15 @@ public:
                                      std::vector<std::string>& gcode,
                                      std::string&              error);
 
+    // Body for Moonraker's /printer/print/start of an uploaded file; a .3mf names the plate it prints
+    static nlohmann::json build_print_start_request(const std::string& filename, int plate_index);
+
 protected:
     void append_print_payload(nlohmann::json& print) const override;
     // Starts the print through Moonraker, whose print start copies the upload to where Qidi's Klipper reads it
     bool print_uploaded_file(const PrintParams& params, const ConnectionSettings& connection, const std::string& filename) override;
+    // QIDI's Moonraker shows the bundle's plate preview on the touchscreen, which a plain G-code upload lacks
+    bool uploads_gcode_3mf() const override { return true; }
     std::string ams_unit_name(int ams_id) const override { return "Qidi Box " + std::to_string(ams_id + 1); }
 
 private:

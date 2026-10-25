@@ -823,15 +823,17 @@ int MoonrakerPrinterAgent::start_local_print(PrintParams params, OnUpdateStatusF
     // - Otherwise params.filename is the exported .3mf archive; the sliced
     //   G-code sits next to it with the same stem (".12345.0.3mf" ->
     //   ".12345.0.gcode"), so swap the extension to upload the actual G-code
-    //   rather than the archive (which Klipper cannot print).
-    std::string gcode_path = params.filename;
+    //   rather than the archive (which Klipper cannot print), unless the
+    //   agent's firmware prints the archive itself.
+    const bool  upload_bundle = params.dst_file.empty() && boost::iends_with(params.filename, ".3mf") && uploads_gcode_3mf();
+    std::string gcode_path    = params.filename;
     if (!params.dst_file.empty()) {
         gcode_path = params.dst_file;
-    } else if (boost::iends_with(gcode_path, ".3mf")) {
+    } else if (boost::iends_with(gcode_path, ".3mf") && !upload_bundle) {
         gcode_path.replace(gcode_path.size() - 4, 4, ".gcode");
     }
 
-    // Check if file exists and has .gcode extension
+    // Check if file exists
     namespace fs = boost::filesystem;
     fs::path source_path(gcode_path);
     if (!fs::exists(source_path)) {
@@ -842,9 +844,9 @@ int MoonrakerPrinterAgent::start_local_print(PrintParams params, OnUpdateStatusF
     // Use the human-readable project name for the uploaded file rather than the
     // internal temp G-code name (e.g. ".12345.0.gcode"). Fall back to the source
     // file's own name when no project name is available.
-    std::string upload_filename = params.project_name.empty()
-                                      ? source_path.filename().string()
-                                      : params.project_name;
+    std::string upload_filename = !params.project_name.empty() ? params.project_name :
+                                  upload_bundle                ? source_path.stem().string() :
+                                                                 source_path.filename().string();
 
     // SDCARD_PRINT_FILE parses its parameters by whitespace, so the printed
     // filename must not contain spaces; collapse any whitespace to underscores.
@@ -852,8 +854,9 @@ int MoonrakerPrinterAgent::start_local_print(PrintParams params, OnUpdateStatusF
         upload_filename.begin(), upload_filename.end(),
         [](unsigned char c) { return std::isspace(c) != 0; }, '_');
 
-    if (!boost::iends_with(upload_filename, ".gcode")) {
-        upload_filename += ".gcode";
+    const char* extension = upload_bundle ? ".gcode.3mf" : ".gcode";
+    if (!boost::iends_with(upload_filename, extension)) {
+        upload_filename += extension;
     }
     // Sanitize filename to prevent path traversal attacks (extra safety)
     upload_filename = sanitize_filename(upload_filename);

@@ -209,6 +209,9 @@ protected:
     void start_status_stream(const std::string& dev_id, ConnectionSettings connection);
     // Starts the print of a file already uploaded to the gcodes root
     virtual bool print_uploaded_file(const PrintParams& params, const ConnectionSettings& connection, const std::string& filename);
+    // Whether start_local_print uploads the sliced .gcode.3mf bundle instead of its plate G-code.
+    // print_uploaded_file then has to start the bundle's plate, PrintParams::plate_index.
+    virtual bool uploads_gcode_3mf() const { return false; }
     void stop_status_stream();
 
     // State access for derived classes

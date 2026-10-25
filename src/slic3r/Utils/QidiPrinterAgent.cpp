@@ -368,11 +368,21 @@ int QidiPrinterAgent::start_local_print(PrintParams params, OnUpdateStatusFn upd
     return MoonrakerPrinterAgent::start_local_print(std::move(params), update_fn, cancel_fn);
 }
 
-bool QidiPrinterAgent::print_uploaded_file(const PrintParams& /*params*/, const ConnectionSettings& connection, const std::string& filename)
+nlohmann::json QidiPrinterAgent::build_print_start_request(const std::string& filename, int plate_index)
+{
+    nlohmann::json request = {{"filename", filename}};
+    if (boost::iends_with(filename, ".3mf")) {
+        // Moonraker prints the bundle's Metadata/plate_<plateindex>.gcode, and QIDI's reads plateindex as a string
+        request["plateindex"] = std::to_string(plate_index);
+    }
+    return request;
+}
+
+bool QidiPrinterAgent::print_uploaded_file(const PrintParams& params, const ConnectionSettings& connection, const std::string& filename)
 {
     // On the X-Max 4 and Q2, Klipper only opens the copy Moonraker's print start makes, so SDCARD_PRINT_FILE can't find the upload
     std::string response;
-    return send_jsonrpc_command(connection, {{"filename", filename}}, response);
+    return send_jsonrpc_command(connection, build_print_start_request(filename, params.plate_index), response);
 }
 
 bool QidiPrinterAgent::fetch_slot_info(const ConnectionSettings& connection,

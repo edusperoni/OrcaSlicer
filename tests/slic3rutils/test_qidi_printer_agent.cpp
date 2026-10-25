@@ -303,3 +303,14 @@ TEST_CASE("Qidi printer accepts a print only while idle", "[QidiPrinterAgent]")
         CHECK_FALSE(QidiPrinterAgent::is_ready_to_print(busy));
     }
 }
+
+TEST_CASE("Qidi print start names the plate only for a 3mf bundle", "[QidiPrinterAgent]")
+{
+    const nlohmann::json bundle = QidiPrinterAgent::build_print_start_request("Stand.gcode.3mf", 3);
+    CHECK(bundle["filename"] == "Stand.gcode.3mf");
+    CHECK(bundle["plateindex"] == "3");
+
+    const nlohmann::json gcode = QidiPrinterAgent::build_print_start_request("Stand.gcode", 3);
+    CHECK(gcode["filename"] == "Stand.gcode");
+    CHECK_FALSE(gcode.contains("plateindex"));
+}
