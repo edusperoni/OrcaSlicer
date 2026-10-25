@@ -85,7 +85,8 @@ QidiPrinterAgent::QidiPrinterAgent(std::string log_dir) : MoonrakerPrinterAgent(
 
 AgentInfo QidiPrinterAgent::get_agent_info_static()
 {
-    return AgentInfo{"qidi", "Qidi", QidiPrinterAgent_VERSION, "Qidi printer agent"};
+    // The native Device and Calibration tabs have nothing to show for Qidi printers yet, so Fluidd's web Device tab is the only one
+    return AgentInfo{"qidi", "Qidi", QidiPrinterAgent_VERSION, "Qidi printer agent", false};
 }
 
 FilamentSyncMode QidiPrinterAgent::get_filament_sync_mode() const
@@ -251,6 +252,13 @@ int QidiPrinterAgent::start_local_print(PrintParams params, OnUpdateStatusFn upd
     if (!apply_box_mapping(params))
         return BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED;
     return MoonrakerPrinterAgent::start_local_print(std::move(params), update_fn, cancel_fn);
+}
+
+bool QidiPrinterAgent::print_uploaded_file(const PrintParams& /*params*/, const ConnectionSettings& connection, const std::string& filename)
+{
+    // On the X-Max 4 and Q2, Klipper only opens the copy Moonraker's print start makes, so SDCARD_PRINT_FILE can't find the upload
+    std::string response;
+    return send_jsonrpc_command(connection, {{"filename", filename}}, response);
 }
 
 bool QidiPrinterAgent::fetch_slot_info(const ConnectionSettings& connection,

@@ -36,6 +36,11 @@ public:
 
     FilamentSyncMode get_filament_sync_mode() const override;
 
+protected:
+    // Starts the print through Moonraker, whose print start copies the upload to where Qidi's Klipper reads it
+    bool print_uploaded_file(const PrintParams& params, const ConnectionSettings& connection, const std::string& filename) override;
+    std::string ams_unit_name(int ams_id) const override { return "Qidi Box " + std::to_string(ams_id + 1); }
+
 private:
     // Push enable_box + value_t<tool> SAVE_VARIABLEs before a print starts.
     // Returns false if any command fails (caller should abort the print).

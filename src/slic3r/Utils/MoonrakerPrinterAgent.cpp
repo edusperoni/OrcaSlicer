@@ -870,17 +870,20 @@ int MoonrakerPrinterAgent::start_local_print(PrintParams params, OnUpdateStatusF
         return BAMBU_NETWORK_ERR_CANCELED;
     }
 
-    // Start print via Moonraker's G-code script endpoint, referencing the file we just uploaded.
     if (update_fn)
         update_fn(PrintingStageSending, 0, _u8L("Starting print..."));
-    std::string gcode = "SDCARD_PRINT_FILE FILENAME=" + upload_filename;
-    if (!send_gcode(connection.dev_id, gcode, connection)) {
+    if (!print_uploaded_file(params, connection, upload_filename)) {
         return BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED;
     }
 
     if (update_fn)
         update_fn(PrintingStageFinished, 100, _u8L("Print started"));
     return BAMBU_NETWORK_SUCCESS;
+}
+
+bool MoonrakerPrinterAgent::print_uploaded_file(const PrintParams& /*params*/, const ConnectionSettings& connection, const std::string& filename)
+{
+    return send_gcode(connection.dev_id, "SDCARD_PRINT_FILE FILENAME=" + filename, connection);
 }
 
 int MoonrakerPrinterAgent::start_sdcard_print(PrintParams params, OnUpdateStatusFn update_fn, WasCancelledFn cancel_fn)
@@ -974,7 +977,13 @@ void MoonrakerPrinterAgent::build_ams_payload(int ams_count, int max_lane_index,
     std::string dev_id   = info.dev_id;
     std::string model_id = info.model_id;
 
-    auto apply = [dev_id, model_id, ams_count, max_lane_index, trays, resolve_tray_ids]() {
+    // Unit names are looked up here because apply must not capture this.
+    std::vector<std::string> unit_names;
+    for (int ams_id = 0; ams_id < ams_count; ++ams_id) {
+        unit_names.push_back(ams_unit_name(ams_id));
+    }
+
+    auto apply = [dev_id, model_id, ams_count, max_lane_index, trays, resolve_tray_ids, unit_names]() {
     // Resolve preset-dependent tray ids on the main thread, not on the background fetch thread
     // that produced `trays`. resolve_tray_ids must not capture `this` (this commit may outlive
     // the agent once queued).
@@ -1006,6 +1015,9 @@ void MoonrakerPrinterAgent::build_ams_payload(int ams_count, int max_lane_index,
         nlohmann::json ams_unit = nlohmann::json::object();
         ams_unit["id"] = std::to_string(ams_id);
         ams_unit["info"] = "0002";  // treat as AMS_LITE 
+        if (!unit_names[ams_id].empty()) {
+            ams_unit["display_name"] = unit_names[ams_id];
+        }
 
         nlohmann::json tray_array = nlohmann::json::array();
         int max_slot_in_this_ams = std::min(3, max_lane_index - ams_id * 4);
@@ -2294,6 +2306,41 @@ bool MoonrakerPrinterAgent::post_print_action(const std::string& action,
     return true;
 }
 
+bool MoonrakerPrinterAgent::send_jsonrpc_command(const ConnectionSettings& connection,
+                                                 const nlohmann::json&     request,
+                                                 std::string&              response) const
+{
+    bool        success = false;
+    std::string http_error;
+
+    auto http = Http::post(join_url(connection.base_url, "/printer/print/start"));
+    configure_http(http, connection);
+    if (!connection.api_key.empty()) {
+        http.header("X-Api-Key", connection.api_key);
+    }
+    http.header("Content-Type", "application/json")
+        .set_post_body(request.dump())
+        .timeout_connect(5)
+        // Some firmware, like Qidi's, copies the file before starting the print and only answers afterwards
+        .timeout_max(60)
+        .on_complete([&](std::string body, unsigned status) {
+            if (status == 200) {
+                response = body;
+                success  = true;
+            } else {
+                http_error = "HTTP " + std::to_string(status);
+            }
+        })
+        .on_error([&](std::string body, std::string err, unsigned status) { http_error = err; })
+        .perform_sync();
+
+    if (!success) {
+        BOOST_LOG_TRIVIAL(error) << "MoonrakerPrinterAgent: JSON-RPC command failed: " << http_error;
+    }
+
+    return success;
+}
+
 void MoonrakerPrinterAgent::send_gcode_async(const std::string& dev_id, const std::string& gcode,
                                              std::function<void(bool)> on_result) const
 {
@@ -3175,6 +3222,7 @@ nlohmann::json MoonrakerPrinterAgent::build_print_payload_locked() const
     }
     home_flag |= (1 << 8); // bits 8-9 = 01 -> HAS_SDCARD_NORMAL (virtual_sdcard always present)
     payload["print"]["home_flag"] = home_flag;
+    payload["print"]["sdcard"]    = true;
 
     // Moonraker doesn't provide temperature ranges via API - use hardcoded defaults
     payload["print"]["nozzle_temp_range"] = {100, 370}; // Typical Klipper range

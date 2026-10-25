@@ -188,6 +188,8 @@ protected:
     using ResolveAmsTrayIdsFn = std::function<void(std::vector<AmsTrayData>&)>;
     void build_ams_payload(int ams_count, int max_lane_index, const std::vector<AmsTrayData>& trays, bool apply_inline = false,
                            ResolveAmsTrayIdsFn resolve_tray_ids = {});
+    // Name shown for a filament unit, or empty for the AMS Lite name
+    virtual std::string ams_unit_name(int /*ams_id*/) const { return {}; }
 
     // Methods that derived classes may need to override or access
     virtual bool init_device_info(const PrinterConnectionParams& params);
@@ -204,6 +206,8 @@ protected:
     static float parse_nozzle_diameter(const nlohmann::json& response);
     // The connection is copied when the stream starts, so changes apply to the next start.
     void start_status_stream(const std::string& dev_id, ConnectionSettings connection);
+    // Starts the print of a file already uploaded to the gcodes root
+    virtual bool print_uploaded_file(const PrintParams& params, const ConnectionSettings& connection, const std::string& filename);
     void stop_status_stream();
 
     // State access for derived classes
@@ -225,6 +229,8 @@ protected:
     std::string normalize_base_url(bool use_ssl, const std::string& host, const std::string& port);
     std::string sanitize_filename(const std::string& filename);
     std::string join_url(const std::string& base_url, const std::string& path) const;
+    // Posts the request to /printer/print/start
+    bool send_jsonrpc_command(const ConnectionSettings& connection, const nlohmann::json& request, std::string& response) const;
 
     // Trim whitespace and convert to uppercase
     static std::string trim_and_upper(const std::string& input);
