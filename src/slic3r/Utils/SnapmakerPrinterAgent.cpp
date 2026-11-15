@@ -2,12 +2,21 @@
 #include "Http.hpp"
 #include "MoonrakerPrinterAgent.hpp"
 #include "IPrinterAgent.hpp"
+#include "bambu_networking.hpp"
 #include "NetworkAgentFactory.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
 
 #include "nlohmann/json.hpp"
+#include <atomic>
 #include <boost/log/trivial.hpp>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <exception>
+#include <mutex>
+#include <sstream>
+#include <thread>
 #include <vector>
 #include <string>
 #include "libslic3r/Preset.hpp"
@@ -21,6 +30,71 @@ namespace Slic3r {
 namespace {
 
 constexpr const char* SNAPMAKER_AGENT_VERSION = "0.0.1";
+constexpr int64_t     CAMERA_REFRESH_INTERVAL_MS = 300'000;
+
+int64_t now_ms()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// RAII release of the in-flight fetch slot; movable so a failed thread start still releases it.
+struct InFlightGuard
+{
+    MoonrakerPrinterAgent* owner;
+    explicit InFlightGuard(MoonrakerPrinterAgent& o) noexcept : owner(&o) {}
+    InFlightGuard(InFlightGuard&& other) noexcept : owner(other.owner) { other.owner = nullptr; }
+    InFlightGuard(const InFlightGuard&) = delete;
+    InFlightGuard& operator=(const InFlightGuard&) = delete;
+    InFlightGuard& operator=(InFlightGuard&&) = delete;
+    ~InFlightGuard() { if (owner) owner->release_fetch_slot(); }
+};
+
+// nlohmann::json::value() returns the default only when the key is absent; a present but
+// null/wrong-typed value throws. Firmware JSON is untrusted, so read defensively.
+int read_int_or(const nlohmann::json& obj, const char* key, int fallback)
+{
+    auto it = obj.find(key);
+    if (it == obj.end()) {
+        return fallback;
+    }
+    if (it->is_number_integer()) {
+        return it->get<int>();
+    }
+    // Firmware may report an integral field as a JSON float (e.g. 2.0). Accept it only when it
+    // has no fractional part, so a genuinely fractional value falls back instead of truncating.
+    if (it->is_number_float()) {
+        const double value = it->get<double>();
+        if (value == std::floor(value)) {
+            return static_cast<int>(value);
+        }
+    }
+    return fallback;
+}
+
+std::vector<std::string> read_string_array_or(const nlohmann::json& obj, const char* key)
+{
+    auto it = obj.find(key);
+    if (it == obj.end() || !it->is_array())
+        return {};
+    std::vector<std::string> out;
+    out.reserve(it->size());
+    for (const auto& v : *it)
+        out.push_back(v.is_string() ? v.get<std::string>() : std::string{});
+    return out;
+}
+
+std::vector<bool> read_bool_array_or(const nlohmann::json& obj, const char* key)
+{
+    auto it = obj.find(key);
+    if (it == obj.end() || !it->is_array())
+        return {};
+    std::vector<bool> out;
+    out.reserve(it->size());
+    for (const auto& v : *it)
+        out.push_back(v.is_boolean() ? v.get<bool>() : false);
+    return out;
+}
 
 // Ranks a candidate that declares no usable colour behind every candidate that does, while
 // still leaving it ahead of no match at all. The largest real distance is 3 * 255^2 = 195075.
@@ -227,6 +301,31 @@ std::string SnapmakerPrinterAgent::find_closest_color_preset_by_vendor_and_type(
 
 SnapmakerPrinterAgent::SnapmakerPrinterAgent(std::string log_dir) : MoonrakerPrinterAgent(std::move(log_dir)) {}
 
+void SnapmakerPrinterAgent::start_camera_monitor()
+{
+    enqueue_command([this] {
+        send_ws_rpc("camera.start_monitor",
+                    {{"domain", "lan"}, {"interval", 0}, {"expect_pw", false}});
+    });
+    m_camera_last_fire_ms.store(now_ms());
+}
+
+void SnapmakerPrinterAgent::on_status_loop_tick(const std::string& dev_id)
+{
+    (void) dev_id;
+    const int64_t last = m_camera_last_fire_ms.load();
+    if (last == 0 || now_ms() - last >= CAMERA_REFRESH_INTERVAL_MS) {
+        start_camera_monitor();
+    }
+}
+
+int SnapmakerPrinterAgent::command_start_camera(std::string dev_id)
+{
+    (void) dev_id;
+    start_camera_monitor();
+    return BAMBU_NETWORK_SUCCESS;
+}
+
 AgentInfo SnapmakerPrinterAgent::get_agent_info_static()
 {
     return AgentInfo{SNAPMAKER_PRINTER_AGENT_ID, "Snapmaker", SNAPMAKER_AGENT_VERSION, "Snapmaker printer agent"};
@@ -257,132 +356,194 @@ std::string SnapmakerPrinterAgent::combine_filament_type(const std::string& type
     return base;
 }
 
-bool SnapmakerPrinterAgent::fetch_filament_info(std::string dev_id, FilamentSyncMode /*sync_mode*/)
+bool SnapmakerPrinterAgent::fetch_filament_info(std::string dev_id, FilamentSyncMode sync_mode)
 {
-    std::string url = join_url(device_info.base_url, "/printer/objects/query?print_task_config&filament_detect");
+    (void) dev_id;
+    if (sync_mode != get_filament_sync_mode())
+        return false;
 
-    std::string response_body;
-    bool        success = false;
-    std::string http_error;
+    // Snapshot everything the fetch needs (URL, api key, TLS/CA): a reconnect can rewrite
+    // device_info meanwhile.
+    const ConnectionSettings connection = get_connection_settings();
 
-    auto http = Http::get(url);
-    if (!device_info.api_key.empty()) {
-        http.header("X-Api-Key", device_info.api_key);
-    }
-    http.timeout_connect(5)
-        .timeout_max(10)
-        .on_complete([&](std::string body, unsigned status) {
-            if (status == 200) {
-                response_body = body;
-                success       = true;
-            } else {
-                http_error = "HTTP error: " + std::to_string(status);
+    // One implementation for both modes; only where it runs differs. pull is the documented
+    // blocking contract (the GUI thread reads DevFilaSystem right after the call), so it runs
+    // on the caller with the payload applied inline. subscription runs on a background thread
+    // so the status loop is not stalled, and the payload is marshalled back to the main thread.
+    auto work = [this, connection](bool apply_inline) -> bool {
+        try {
+            const std::string url = join_url(connection.base_url, "/printer/objects/query?print_task_config&filament_detect");
+
+            std::string response_body;
+            bool success = false;
+            std::string http_error;
+
+            auto http = Http::get(url);
+            configure_http(http, connection);
+            if (!connection.api_key.empty()) {
+                http.header("X-Api-Key", connection.api_key);
             }
-        })
-        .on_error([&](std::string body, std::string err, unsigned status) {
-            http_error = err;
-            if (status > 0) {
-                http_error += " (HTTP " + std::to_string(status) + ")";
+            http.timeout_connect(5)
+                .timeout_max(10)
+                .on_complete([&](std::string body, unsigned status) {
+                    if (status == 200) {
+                        response_body = body;
+                        success       = true;
+                    } else {
+                        http_error = "HTTP error: " + std::to_string(status);
+                    }
+                })
+                .on_error([&](std::string body, std::string err, unsigned status) {
+                    http_error = err;
+                    if (status > 0) {
+                        http_error += " (HTTP " + std::to_string(status) + ")";
+                    }
+                })
+                .perform_sync();
+
+            if (!success) {
+                BOOST_LOG_TRIVIAL(warning) << "SnapmakerPrinterAgent::fetch_filament_info: HTTP request failed: " << http_error;
+                return false;
             }
-        })
-        .perform_sync();
 
-    if (!success) {
-        BOOST_LOG_TRIVIAL(warning) << "SnapmakerPrinterAgent::fetch_filament_info: HTTP request failed: " << http_error;
-        return false;
-    }
+            auto json = nlohmann::json::parse(response_body, nullptr, false, true);
+            if (json.is_discarded()) {
+                BOOST_LOG_TRIVIAL(warning) << "SnapmakerPrinterAgent::fetch_filament_info: Invalid JSON response";
+                return false;
+            }
 
-    auto json = nlohmann::json::parse(response_body, nullptr, false, true);
-    if (json.is_discarded()) {
-        BOOST_LOG_TRIVIAL(warning) << "SnapmakerPrinterAgent::fetch_filament_info: Invalid JSON response";
-        return false;
-    }
+            // Navigate to result.status.print_task_config
+            if (!json.contains("result") || !json["result"].contains("status") || !json["result"]["status"].contains("print_task_config")) {
+                BOOST_LOG_TRIVIAL(warning) << "SnapmakerPrinterAgent::fetch_filament_info: Missing print_task_config in response";
+                return false;
+            }
 
-    // Navigate to result.status.print_task_config
-    if (!json.contains("result") || !json["result"].contains("status") ||
-        !json["result"]["status"].contains("print_task_config")) {
-        BOOST_LOG_TRIVIAL(warning) << "SnapmakerPrinterAgent::fetch_filament_info: Missing print_task_config in response";
-        return false;
-    }
+            auto& ptc = json["result"]["status"]["print_task_config"];
 
-    auto& ptc = json["result"]["status"]["print_task_config"];
+            // Read parallel arrays from print_task_config
+            auto filament_exist    = read_bool_array_or(ptc, "filament_exist");
+            auto filament_type     = read_string_array_or(ptc, "filament_type");
+            auto filament_sub_type = read_string_array_or(ptc, "filament_sub_type");
+            auto filament_color    = read_string_array_or(ptc, "filament_color_rgba");
+            auto filament_vendor   = read_string_array_or(ptc, "filament_vendor");
 
-    // Read parallel arrays from print_task_config
-    auto filament_exist    = ptc.value("filament_exist", std::vector<bool>{});
-    auto filament_type     = ptc.value("filament_type", std::vector<std::string>{});
-    auto filament_sub_type = ptc.value("filament_sub_type", std::vector<std::string>{});
-    auto filament_color    = ptc.value("filament_color_rgba", std::vector<std::string>{});
-    auto filament_vendor   = ptc.value("filament_vendor", std::vector<std::string>{});
+            const int slot_count = static_cast<int>(filament_exist.size());
+            if (slot_count == 0) {
+                BOOST_LOG_TRIVIAL(info) << "SnapmakerPrinterAgent::fetch_filament_info: No filament slots reported";
+                return false;
+            }
 
-    const int slot_count = static_cast<int>(filament_exist.size());
-    if (slot_count == 0) {
-        BOOST_LOG_TRIVIAL(info) << "SnapmakerPrinterAgent::fetch_filament_info: No filament slots reported";
-        return false;
-    }
+            // Read NFC filament_detect data for temperature info (optional)
+            nlohmann::json nfc_info;
+            if (json["result"]["status"].contains("filament_detect") && json["result"]["status"]["filament_detect"].contains("info")) {
+                nfc_info = json["result"]["status"]["filament_detect"]["info"];
+            }
 
-    // Read NFC filament_detect data for temperature info (optional)
-    nlohmann::json nfc_info;
-    if (json["result"]["status"].contains("filament_detect") &&
-        json["result"]["status"]["filament_detect"].contains("info")) {
-        nfc_info = json["result"]["status"]["filament_detect"]["info"];
-    }
+            static const std::string empty_str;
+            static const std::string default_color = "FFFFFFFF";
 
-    static const std::string empty_str;
-    static const std::string default_color = "FFFFFFFF";
+            // Per-tray vendor names and sub types, kept so the preset lookup can run on the main thread.
+            std::vector<std::string> vendors(slot_count);
+            std::vector<std::string> sub_types(slot_count);
 
-    std::vector<AmsTrayData> trays;
-    trays.reserve(slot_count);
+            std::vector<AmsTrayData> trays;
+            trays.reserve(slot_count);
 
-    for (int i = 0; i < slot_count; ++i) {
-        AmsTrayData tray;
-        tray.slot_index   = i;
-        tray.has_filament = filament_exist[i];
+            for (int i = 0; i < slot_count; ++i) {
+                AmsTrayData tray;
+                tray.slot_index   = i;
+                tray.has_filament = filament_exist[i];
 
-        if (tray.has_filament) {
-            const std::string raw_sub_type = safe_at(filament_sub_type, i, empty_str);
-            tray.tray_type     = combine_filament_type(safe_at(filament_type, i, empty_str), raw_sub_type);
-            tray.tray_color    = safe_at(filament_color, i, empty_str);
-            if (tray.tray_color.empty())
-                tray.tray_color = default_color;
+                if (tray.has_filament) {
+                    const std::string raw_sub_type = safe_at(filament_sub_type, i, empty_str);
+                    tray.tray_type  = combine_filament_type(safe_at(filament_type, i, empty_str), raw_sub_type);
+                    tray.tray_color = safe_at(filament_color, i, empty_str);
+                    if (tray.tray_color.empty())
+                        tray.tray_color = default_color;
+                    vendors[i]   = safe_at(filament_vendor, i, empty_str);
+                    sub_types[i] = trim_and_upper(raw_sub_type) == "NONE" ? std::string() : raw_sub_type;
 
-            auto* bundle = GUI::wxGetApp().preset_bundle;
-            // Try to find a matching preset for this filament based on vendor, type and color.
-            // If not found, default to traditional search by type only or generic type mapping.
-            if (bundle) {
-                std::string vendor   = safe_at(filament_vendor, i, empty_str);
-                std::string sub_type = raw_sub_type;
-                if (trim_and_upper(sub_type) == "NONE")
-                    sub_type.clear();
-                std::string filament_id = find_closest_color_preset_by_vendor_and_type(bundle->filaments, vendor, tray.tray_type,
-                                                                                       sub_type, tray.tray_color);
+                    // Generic id derived from device data only; the preset-dependent lookup runs
+                    // on the main thread in the resolve hook passed to build_ams_payload.
+                    tray.tray_info_idx = map_filament_type_to_generic_id(tray.tray_type);
 
-                if (!filament_id.empty()) {
-                    tray.tray_info_idx = filament_id;
-                    BOOST_LOG_TRIVIAL(warning) << "Filament sync: Found profile for slot " << i << ": "
-                                               << filament_id;
-                } else {
-                    tray.tray_info_idx = bundle->filaments.filament_id_by_type(tray.tray_type);
-                    if (tray.tray_info_idx.empty())
-                        tray.tray_info_idx = map_filament_type_to_generic_id(tray.tray_type);
+                    // Extract NFC temperature data if available
+                    if (nfc_info.is_array() && i < static_cast<int>(nfc_info.size()) && nfc_info[i].is_object()) {
+                        auto& nfc_slot = nfc_info[i];
+                        tray.bed_temp  = read_int_or(nfc_slot, "BED_TEMP", 0);
+                        // build_ams_payload publishes this as `nozzle_temp_max`, and FIRST_LAYER_TEMP is 0 for external tags.
+                        tray.nozzle_temp = read_int_or(nfc_slot, "HOTEND_MAX_TEMP", 0);
+                    }
                 }
-            } else {
-                tray.tray_info_idx = map_filament_type_to_generic_id(tray.tray_type);
+
+                trays.emplace_back(std::move(tray));
             }
 
-            // Extract NFC temperature data if available
-            if (nfc_info.is_array() && i < static_cast<int>(nfc_info.size()) && nfc_info[i].is_object()) {
-                auto& nfc_slot = nfc_info[i];
-                tray.bed_temp  = safe_json_int(nfc_slot, "BED_TEMP");
-                // build_ams_payload publishes this as `nozzle_temp_max`, and FIRST_LAYER_TEMP is 0 for external tags.
-                tray.nozzle_temp = safe_json_int(nfc_slot, "HOTEND_MAX_TEMP");
-            }
+            // Resolve against GUI-owned presets on the main thread (inside build_ams_payload).
+            auto resolve_ids = [vendors, sub_types](std::vector<AmsTrayData>& resolved_trays) {
+                auto* bundle = GUI::wxGetApp().preset_bundle;
+                if (!bundle) {
+                    return; // keep the generic ids computed from device data
+                }
+                for (size_t i = 0; i < resolved_trays.size() && i < vendors.size() && i < sub_types.size(); ++i) {
+                    AmsTrayData& tray = resolved_trays[i];
+                    if (!tray.has_filament) {
+                        continue;
+                    }
+                    // Prefer a manufacturer/colour-specific preset, else fall back to type.
+                    std::string filament_id = find_closest_color_preset_by_vendor_and_type(bundle->filaments, vendors[i], tray.tray_type,
+                                                                                           sub_types[i], tray.tray_color);
+                    if (filament_id.empty())
+                        filament_id = bundle->filaments.filament_id_by_type(tray.tray_type);
+                    tray.tray_info_idx = filament_id.empty() ? map_filament_type_to_generic_id(tray.tray_type) : filament_id;
+                }
+            };
+            build_ams_payload(1, slot_count - 1, trays, apply_inline, resolve_ids);
+            return true;
+        } catch (const std::exception& e) {
+            // why: an exception escaping a detached thread is std::terminate, and firmware
+            // JSON is untrusted; mirror run_command_worker and swallow it here.
+            BOOST_LOG_TRIVIAL(error) << "SnapmakerPrinterAgent::fetch_filament_info: unhandled exception: " << e.what();
+            return false;
+        } catch (...) {
+            BOOST_LOG_TRIVIAL(error) << "SnapmakerPrinterAgent::fetch_filament_info: unhandled exception";
+            return false;
         }
+    };
 
-        trays.emplace_back(std::move(tray));
+    if (sync_mode == FilamentSyncMode::pull) {
+        return work(/*apply_inline=*/true);
     }
 
-    build_ams_payload(1, slot_count - 1, trays);
+    // Subscription: fire-and-forget. A `true` return means the refresh was scheduled (or is
+    // already running), not that DevFilaSystem has been updated. Reserve under the same mutex
+    // shutdown() uses, so the flag and the count can't race.
+    {
+        std::lock_guard<std::mutex> lock(fetch_lifecycle_mutex);
+        if (shutting_down.load())
+            return false;
+        if (filament_fetch_in_flight.load() > 0)
+            return true; // a fetch is already running; don't pile on
+        filament_fetch_in_flight.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    InFlightGuard guard{*this};
+    std::thread([work = std::move(work), guard = std::move(guard)]() mutable {
+        work(/*apply_inline=*/false);
+    }).detach();
     return true;
+}
+
+std::string SnapmakerPrinterAgent::get_camera_url() const
+{
+    return join_url(get_connection_settings().base_url, "/server/files/camera/monitor.jpg");
+}
+
+FilamentSyncMode SnapmakerPrinterAgent::get_filament_sync_mode() const
+{
+    if (GUI::wxGetApp().app_config->get_bool("use_printer_agents"))
+        return FilamentSyncMode::subscription;
+    return FilamentSyncMode::pull;
 }
 
 } // namespace Slic3r

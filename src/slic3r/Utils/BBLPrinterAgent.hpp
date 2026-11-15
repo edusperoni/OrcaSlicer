@@ -124,6 +124,7 @@ public:
     static void trust_ca_file(const std::string& dev_id, const std::string& ca_file);
 
 private:
+    // why: the lan/cloud DECISION stays machine-side; keep this mechanical branch in sync with publish_json.
     int publish(const std::string& dev_id, const nlohmann::json& j, bool lan_mode);
 };
 
